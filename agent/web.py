@@ -12,11 +12,18 @@ from typing import TYPE_CHECKING
 from flask import Flask, Response, jsonify, request
 from passlib.hash import pbkdf2_sha256 as pbkdf2
 from playhouse.shortcuts import model_to_dict
+from rq.exceptions import NoSuchJobError
+from rq.job import Job as RQJob
+from rq.job import JobStatus
 
+from agent.base import AgentException
 from agent.builder import ImageBuilder, get_image_build_context_directory
 from agent.database import JSONEncoderForSQLQueryResult
+from agent.database_physical_backup import DatabasePhysicalBackup
+from agent.database_physical_restore import DatabasePhysicalRestore
 from agent.database_server import DatabaseServer
 from agent.exceptions import BenchNotExistsException, SiteNotExistsException
+from agent.job import Job as AgentJob
 from agent.job import JobModel, connection
 from agent.minio import Minio
 from agent.monitor import Monitor
@@ -79,6 +86,10 @@ log.handlers = []
 
 @application.before_request
 def validate_access_token():
+    exempt_endpoints = ["get_metrics"]
+    if request.endpoint in exempt_endpoints:
+        return None
+
     try:
         if application.debug:
             return None
@@ -218,10 +229,34 @@ def get_benches():
     return {name: bench.dump() for name, bench in Server().benches.items()}
 
 
+@application.route("/benches/metrics")
+def get_metrics():
+    from agent.exporter import get_metrics
+
+    benches_metrics = [
+        get_metrics(name, rq_port)
+        for name, bench in Server().benches.items()
+        if (rq_port := bench.bench_config.get("rq_port")) is not None
+    ]
+    return Response(benches_metrics, mimetype="text/plain")
+
+
 @application.route("/benches/<string:bench>")
 @validate_bench
 def get_bench(bench):
     return Server().benches[bench].dump()
+
+
+@application.route("/benches/<string:bench_str>/metrics", methods=["GET"])
+def get_bench_metrics(bench_str):
+    from agent.exporter import get_metrics
+
+    bench = Server().benches[bench_str]
+    rq_port = bench.bench_config.get("rq_port")
+    if rq_port:
+        return Response(get_metrics(bench_str, rq_port), mimetype="text/plain")
+
+    return Response("Unavailable", status=400, mimetype="text/plain")
 
 
 @application.route("/benches/<string:bench>/info", methods=["POST", "GET"])
@@ -708,6 +743,25 @@ def clear_site_cache(bench, site):
 
 
 @application.route(
+    "/benches/<string:bench>/sites/<string:site>/activate",
+    methods=["POST"],
+)
+@validate_bench_and_site
+def activate_site(bench, site):
+    job = Server().activate_site_job(site, bench)
+    return {"job": job}
+
+
+@application.route(
+    "/benches/<string:bench>/sites/<string:site>/deactivate",
+    methods=["POST"],
+)
+def deactivate_site(bench, site):
+    job = Server().deactivate_site_job(site, bench)
+    return {"job": job}
+
+
+@application.route(
     "/benches/<string:bench>/sites/<string:site>/update/migrate",
     methods=["POST"],
 )
@@ -748,6 +802,7 @@ def update_site_recover_migrate(bench, site):
         data["target"],
         data.get("activate", True),
         data.get("rollback_scripts", {}),
+        data.get("restore_touched_tables", True),
     )
     return {"job": job}
 
@@ -1007,6 +1062,37 @@ def update_monitor_rules():
     return {}
 
 
+@application.route("/database/physical-backup", methods=["POST"])
+def physical_backup_database():
+    data = request.json
+    job = DatabasePhysicalBackup(
+        databases=data["databases"],
+        db_user="root",
+        db_host=data["private_ip"],
+        db_password=data["mariadb_root_password"],
+        site_backup_name=data["site_backup"]["name"],
+        snapshot_trigger_url=data["site_backup"]["snapshot_trigger_url"],
+        snapshot_request_key=data["site_backup"]["snapshot_request_key"],
+    ).create_backup_job()
+    return {"job": job}
+
+
+@application.route("/database/physical-restore", methods=["POST"])
+def physical_restore_database():
+    data = request.json
+    job = DatabasePhysicalRestore(
+        backup_db=data["backup_db"],
+        target_db=data["target_db"],
+        target_db_root_password=data["target_db_root_password"],
+        target_db_port=3306,
+        target_db_host=data["private_ip"],
+        backup_db_base_directory=data.get("backup_db_base_directory", ""),
+        restore_specific_tables=data.get("restore_specific_tables", False),
+        tables_to_restore=data.get("tables_to_restore", []),
+    ).create_restore_job()
+    return {"job": job}
+
+
 @application.route("/database/binary/logs")
 def get_binary_logs():
     return jsonify(DatabaseServer().binary_logs)
@@ -1123,10 +1209,38 @@ def proxysql_remove_user(username):
     return {"job": job}
 
 
+def get_status_from_rq(job, redis):
+    RQ_STATUS_MAP = {
+        JobStatus.QUEUED: "Pending",
+        JobStatus.FINISHED: "Success",
+        JobStatus.FAILED: "Failure",
+        JobStatus.STARTED: "Running",
+        JobStatus.DEFERRED: "Pending",
+        JobStatus.SCHEDULED: "Pending",
+        JobStatus.STOPPED: "Failure",
+        JobStatus.CANCELED: "Failure",
+    }
+    status = None
+    try:
+        rq_status = RQJob.fetch(str(job["id"]), connection=redis).get_status()
+        status = RQ_STATUS_MAP.get(rq_status)
+    except NoSuchJobError:
+        # Handle jobs enqueued before we started setting job_id
+        pass
+    return status
+
+
 def to_dict(model):
     redis = connection()
     if isinstance(model, JobModel):
         job = model_to_dict(model, backrefs=True)
+        status_from_rq = get_status_from_rq(job, redis)
+        if status_from_rq:
+            # Override status from JobModel if rq says the job is already ended
+            TERMINAL_STATUSES = ["Success", "Failure"]
+            if job["status"] not in TERMINAL_STATUSES and status_from_rq in TERMINAL_STATUSES:
+                job["status"] = status_from_rq
+
         job["data"] = json.loads(job["data"]) or {}
         job_key = f"agent:job:{job['id']}"
         job["commands"] = [json.loads(command) for command in redis.lrange(job_key, 0, -1)]
@@ -1162,6 +1276,14 @@ def jobs(id=None, ids=None, status=None):
     else:
         data = get_jobs(limit=100)
 
+    return jsonify(json.loads(json.dumps(data, default=str)))
+
+
+@application.route("/jobs/<int:id>/cancel", methods=["POST"])
+def cancel_job(id=None):
+    job = AgentJob(id=id)
+    job.cancel_or_stop()
+    data = to_dict(job.model)
     return jsonify(json.loads(json.dumps(data, default=str)))
 
 
@@ -1342,6 +1464,8 @@ def all_exception_handler(error):
         capture_exception(error)
     except ImportError:
         pass
+    if isinstance(error, AgentException):
+        return json.loads(json.dumps(error.data, default=str)), 500
     return {"error": "".join(traceback.format_exception(*sys.exc_info())).splitlines()}, 500
 
 
